@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Cysharp.Threading.Tasks;
 using Solana.Unity.Rpc;
@@ -392,6 +393,7 @@ namespace Solana.Unity.SDK
             // Fetch nfts
             List<UniTask> loadingTasks = new List<UniTask>();
             List<Nft.Nft> nfts = new List<Nft.Nft>(_nfts);
+            SemaphoreSlim throttler = null;
 
             var total = 0;
             if (tokens is {Count: > 0})
@@ -401,31 +403,93 @@ namespace Solana.Unity.SDK
                     .Where(item => nfts
                         .All(t => t.metaplexData.data.mint!= item.Account.Data.Parsed.Info.Mint)).ToArray();
                 total = nfts.Count + toFetch.Length;
-                
+
+                var effectiveDelay = requestsMillisecondsDelay;
+                if (Application.platform == RuntimePlatform.WebGLPlayer)
+                {
+                    effectiveDelay = Math.Max(effectiveDelay, 100);
+                }
+                effectiveDelay = Math.Max(effectiveDelay, NftLoadingRequestsDelay);
+
+                var maxConcurrency = Application.platform == RuntimePlatform.WebGLPlayer
+                    ? 1
+                    : Math.Max(1, Math.Min(8, Environment.ProcessorCount));
+                throttler = new SemaphoreSlim(maxConcurrency);
+
                 foreach (var item in toFetch)
                 {
-                    if (Application.platform == RuntimePlatform.WebGLPlayer)
+                    var mint = item.Account.Data.Parsed.Info.Mint;
+                    async UniTask LoadNftAsync()
                     {
-                        // If we are on WebGL, we need to add a min delay between requests
-                        requestsMillisecondsDelay = Mathf.Max(requestsMillisecondsDelay, 100, NftLoadingRequestsDelay);
-                    }
-                    if (requestsMillisecondsDelay > 0) await UniTask.Delay(requestsMillisecondsDelay);
-                    await UniTask.SwitchToMainThread();
-                    var tNft = Nft.Nft.TryGetNftData(item.Account.Data.Parsed.Info.Mint, Rpc, loadTexture: loadTexture).AsUniTask();
-                    loadingTasks.Add(tNft);
-                    tNft.ContinueWith(nft =>
+                        if (effectiveDelay > 0)
                         {
-                            if(tNft.AsTask().Exception != null || nft == null) {
-                                total--;
+                            await UniTask.Delay(effectiveDelay);
+                        }
+
+                        await throttler.WaitAsync();
+                        try
+                        {
+                            await UniTask.SwitchToThreadPool();
+                            Nft.Nft nft = null;
+                            Exception fetchException = null;
+                            try
+                            {
+                                nft = await Nft.Nft.TryGetNftData(mint, Rpc, loadTexture: false);
+                            }
+                            catch (Exception ex)
+                            {
+                                fetchException = ex;
+                            }
+
+                            await UniTask.SwitchToMainThread();
+
+                            if (fetchException != null || nft == null)
+                            {
+                                if (fetchException != null)
+                                {
+                                    Debug.LogWarning($"Failed to load NFT {mint}: {fetchException.Message}");
+                                }
+                                if (Volatile.Read(ref total) > nfts.Count)
+                                {
+                                    Interlocked.Decrement(ref total);
+                                }
                                 return;
                             }
+
+                            if (loadTexture)
+                            {
+                                try
+                                {
+                                    await nft.LoadTexture();
+                                }
+                                catch (Exception textureException)
+                                {
+                                    Debug.LogWarning($"Failed to load NFT texture {mint}: {textureException.Message}");
+                                }
+                            }
+
                             nfts.Add(nft);
-                            if(notifyRegisteredListeners) 
+                            if(notifyRegisteredListeners)
                                 OnNFTsUpdateInternal?.Invoke(nfts, total);
-                        }).Forget();
+                        }
+                        finally
+                        {
+                            throttler.Release();
+                        }
+                    }
+
+                    loadingTasks.Add(LoadNftAsync());
                 }
             }
-            await UniTask.WhenAll(loadingTasks);
+            try
+            {
+                await UniTask.WhenAll(loadingTasks);
+            }
+            finally
+            {
+                throttler?.Dispose();
+            }
+            await UniTask.SwitchToMainThread();
             OnNFTsUpdateInternal?.Invoke(nfts, nfts.Count);
             _nfts = nfts;
             return nfts;

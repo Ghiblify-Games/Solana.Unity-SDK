@@ -174,9 +174,14 @@ namespace Solana.Unity.SDK
 
         public Dictionary<string, LoginConfigItem> BuildLoginConfigDictionary(List<LoginConfig> loginConfigList) {
             if (loginConfigList == null) return null;
-            var dictionary = new Dictionary<string, LoginConfigItem>();
+            var dictionary = new Dictionary<string, LoginConfigItem>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var config in loginConfigList) {
+                if (string.IsNullOrWhiteSpace(config?.name))
+                {
+                    Debug.LogWarning("Skipping Web3Auth login config with empty name.");
+                    continue;
+                }
                 var loginConfigItem = new LoginConfigItem {
                     verifier = config.verifier,
                     typeOfLogin = config.typeOfLogin,
@@ -193,7 +198,7 @@ namespace Solana.Unity.SDK
                     showOnMobile = config.showOnMobile
                 };
 
-                dictionary.Add(config.name, loginConfigItem);
+                dictionary[config.name] = loginConfigItem;
             }
 
             return dictionary;

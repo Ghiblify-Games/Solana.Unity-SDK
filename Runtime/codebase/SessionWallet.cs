@@ -60,6 +60,21 @@ namespace Solana.Unity.SDK
                 sessionSigner: Account.PublicKey
             );
         }
+
+        private static string ResolveExternalRpcUri(WalletBase externalWallet)
+        {
+            if (externalWallet == null) return null;
+            try
+            {
+                var nodeAddress = externalWallet.ActiveRpcClient?.NodeAddress;
+                return nodeAddress?.AbsoluteUri;
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning($"Unable to resolve RPC endpoint from external wallet: {exception.Message}");
+                return null;
+            }
+        }
         
         public void SignInitSessionTx(Transaction tx)
         {
@@ -87,8 +102,7 @@ namespace Solana.Unity.SDK
             // Generate the keypair from the signed and hashed seed
             var wallet = new Wallet.Wallet(signature);
             
-            // TODO: ActiveRpcClient can be null, get node address some other way
-            var sessionWallet = new SessionWallet(externalWallet.RpcCluster, externalWallet.ActiveRpcClient.NodeAddress.ToString())
+            var sessionWallet = new SessionWallet(externalWallet.RpcCluster, ResolveExternalRpcUri(externalWallet))
             {
                 TargetProgram = targetProgram,
                 EncryptedKeystoreKey = $"{_externalWallet.Account.PublicKey}_SessionKeyStore",
@@ -113,7 +127,7 @@ namespace Solana.Unity.SDK
             externalWallet ??= Web3.Wallet;
             _externalWallet = externalWallet;
             
-            SessionWallet sessionWallet = new SessionWallet(externalWallet.RpcCluster, externalWallet.ActiveRpcClient.NodeAddress.ToString())
+            SessionWallet sessionWallet = new SessionWallet(externalWallet.RpcCluster, ResolveExternalRpcUri(externalWallet))
             {
                 TargetProgram = targetProgram,
                 EncryptedKeystoreKey = $"{_externalWallet.Account.PublicKey}_SessionKeyStore"
@@ -247,7 +261,7 @@ namespace Solana.Unity.SDK
             using SHA256 sha256Hash = SHA256.Create();
             // ComputeHash - returns byte array
             var bytes = sha256Hash.ComputeHash(Encoding.UTF8.GetBytes(rawData));
-            return Encoding.UTF8.GetString(bytes);
+            return Convert.ToBase64String(bytes);
         }
 
 
@@ -276,15 +290,24 @@ namespace Solana.Unity.SDK
             };
 
             // Get balance and calculate refund
-            var balance = (await GetBalance(Account.PublicKey)) * SolLamports;
-            var estimatedFees = await ActiveRpcClient.GetFeeForMessageAsync(tx.CompileMessage(), Commitment.Confirmed);
-            var refund = balance - estimatedFees.Result.Value * 1;
-            Debug.Log($"LAMPORTS Balance: {balance}, Refund: {refund}");
+            var rpcClient = ActiveRpcClient;
+            if (rpcClient == null)
+            {
+                Debug.LogWarning("Unable to close session: RPC client is unavailable.");
+                return;
+            }
+
+            var balanceResult = await rpcClient.GetBalanceAsync(Account.PublicKey, commitment);
+            var balanceLamports = balanceResult.Result?.Value ?? 0UL;
+            var feeResult = await rpcClient.GetFeeForMessageAsync(tx.CompileMessage(), Commitment.Confirmed);
+            var feeLamports = feeResult.Result?.Value ?? 0UL;
+            var refund = balanceLamports > feeLamports ? balanceLamports - feeLamports : 0UL;
+            Debug.Log($"LAMPORTS Balance: {balanceLamports}, Refund: {refund}");
 
             tx.Add(RevokeSessionIX());
             // Issue Refund
-            if (refund != null)
-                tx.Add(SystemProgram.Transfer(Account.PublicKey, _externalWallet.Account.PublicKey, (ulong)refund));
+            if (refund > 0)
+                tx.Add(SystemProgram.Transfer(Account.PublicKey, _externalWallet.Account.PublicKey, refund));
             var rest = await SignAndSendTransaction(tx, commitment: commitment);
             DeleteSessionWallet();
         }
